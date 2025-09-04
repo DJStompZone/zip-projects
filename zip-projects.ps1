@@ -597,7 +597,7 @@ foreach ($dir in $targets) {
         Write-Warning ("Error processing {0}: {1}" -f $dir.Name, $_)
     }
     finally {
-        if (Test-Path -LiteralPath $stageDir)) {
+        if (Test-Path -LiteralPath $stageDir) {
             if ($PSCmdlet.ShouldProcess($stageDir, "Cleanup staging")) {
                 Remove-Item -LiteralPath $stageDir -Recurse -Force
             }
