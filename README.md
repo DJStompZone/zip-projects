@@ -1,42 +1,45 @@
-# zip-projects.ps1
+# zip-projects
 
-`zip-projects.ps1` is a PowerShell utility for packaging project folders into `.zip` archives. It is designed for environments where projects are numerous, large, and scattered with heavy dependencies. The script automates detection, staging, compression, and cleanup while staying efficient and predictable.
+`zip-projects.ps1` is a PowerShell utility for packaging project folders into `.zip` archives.
 
 ## Features
 
-- Detects top-level directories containing project markers:
+- Detects top-level directories containing any of these marker files:
   - `README.md`
   - `manifest.json`
   - `pyproject.toml`
   - `package.json`
-- Skips directories with a top-level `.zipignore`.
-- Excludes common heavy subtrees (`node_modules`, `.venv`, `venv`).
-- Optional exclusion of file extensions via `-ExcludeExtensions`.
-- Stages files into a temporary working area before archiving.
+- Skips directories with a top-level `.zipignore`
+- Excludes common heavy subtrees (`node_modules`, `.venv`, `venv`)
+- Optional exclusion of file extensions via `-ExcludeExtensions`
+- Stages files into a temporary working area before archiving
 - Creates archives with:
-  - Native `zip` binary if available.
-  - Fallback to `Compress-Archive` if not.
-- Verifies archives with `unzip -tq` when available, else .NET ZipArchive.
-- Deletes source directories only on verified success.
+  - Native `zip` (preferred) if available
+  - Else fallback to `Compress-Archive`
+- Verifies archives with `unzip -tq` when available, otherwise via .NET `ZipArchive`
+- Deletes source directories only on verified success
 - Controlled overwrite behavior:
-  - `-Force` overwrites existing archives.
-  - `-NoClobber` prevents overwrite.
-  - Without either flag, overwrite requires confirmation.
-- Scaled progress reporting suitable for both small and very large projects.
+  - `-Force` overwrites existing archives
+  - `-NoClobber` prevents overwrite
+  - With neither flag, overwrite requires confirmation
+- Scaled progress reporting suitable for both small and very large projects
 
 ## Requirements
 
 - PowerShell 7+
+- Optional
+  - `zip`
+  - `unzip`
 
 ## Usage
 
-### Basic run
+### Specify a root directory
 
 ```powershell
-./zip-projects.ps1
-````
+./zip-projects.ps1 ~/Projects
+```
 
-Archives all eligible projects in the current directory to `./compressed/`.
+Scans and archives projects under `~/Projects` into `~/Projects/compressed/`.
 
 ### Exclude extensions
 
@@ -66,22 +69,22 @@ Abort if the archive already exists.
 ./zip-projects.ps1 -WhatIf
 ```
 
-Shows planned actions without making changes.
+Show planned actions without making changes.
 
 ## Behavior
 
 1. **Stage 1 – Discovery**
-   Top-level directories are scanned. Directories with `.zipignore` are skipped. A project is selected if any marker file is found.
+   Top-level directories under `Root` are scanned. Directories with a top-level `.zipignore` are skipped immediately. A project is selected if any marker file appears anywhere in the tree.
 
 2. **Stage 2 – Archiving**
-   Selected directories are staged into a filtered copy, excluding ignored directories and extensions. The staging area is archived, verified, and the source directory is deleted on success.
+   Selected directories are staged into a filtered copy, excluding ignored directories and any extensions you specify. The staging area is archived using native `zip` (if present) or `Compress-Archive` (fallback), verified for integrity, and the **source directory is deleted** only after a verified archive exists.
 
 ## Notes
 
-* Archives are written to `./compressed/`.
-* Temporary staging occurs under `./__staging_pack/` and is removed after each run.
-* Progress reporting updates scale with the number of files; large projects do not stall due to frequent updates.
+* Archives are written to `./compressed/` under the specified `Root`.
+* Temporary staging occurs under `./__staging_pack/` and is removed after each project.
+* Progress updates scale with item counts; large projects remain responsive without chatty updates.
 
 ## License
 
-MIT License. See the LICENSE file for details.
+MIT License. See the [LICENSE](LICENSE) file for details.

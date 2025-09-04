@@ -1,5 +1,5 @@
 <#PSScriptInfo
-.VERSION 1.9.0
+.VERSION 1.10.0
 .GUID 4c3f8c5b-4f88-47e7-9a45-2a38c1a9a0b3
 .AUTHOR DJ Stomp <85457381+DJStompZone@users.noreply.github.com>
 .COPYRIGHT (c) DJ Stomp. MIT License.
@@ -10,7 +10,7 @@
 Zip top-level folders that contain specific marker files and delete sources on success, with scalable progress, path-typed lists, .zipignore support, and SOLID archiver abstraction.
 
 .DESCRIPTION
-Stage 1 scans top-level subdirectories in the current directory. If a subdirectory’s immediate children contain ".zipignore"
+Stage 1 scans top-level subdirectories under the specified Root. If a subdirectory’s immediate children contain ".zipignore"
 (file or directory), it is skipped entirely. Otherwise, if its tree contains any of:
   - README.md
   - manifest.json
@@ -34,6 +34,9 @@ Progress cadence scales with size:
 
 Overwrites of existing archives are controlled by -Force / -NoClobber with ShouldProcess confirmation if neither is set.
 
+.PARAMETER Root
+Root directory to scan. Defaults to the current directory.
+
 .PARAMETER ExcludeExtensions
 One or more file extensions to exclude during staging. Example: -ExcludeExtensions .zip,.rar,.iso
 
@@ -50,7 +53,7 @@ Shows what would happen if the script runs. No changes are made.
 PS> ./zip-projects.ps1
 
 .EXAMPLE
-PS> ./zip-projects.ps1 -ExcludeExtensions .zip,.rar
+PS> ./zip-projects.ps1 ~/Projects -ExcludeExtensions .zip,.rar
 
 .EXAMPLE
 PS> ./zip-projects.ps1 -Force
@@ -58,15 +61,28 @@ PS> ./zip-projects.ps1 -Force
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
 param(
+    [Parameter(Position=0)]
+    [string]$Root = (Get-Location).Path,
     [string[]]$ExcludeExtensions,
     [switch]$Force,
     [switch]$NoClobber
 )
 
+# Resolve and validate root once; expose as script-scoped for all helpers.
+try {
+    $script:Root = (Resolve-Path -LiteralPath $Root).Path
+} catch {
+    throw "Root path not found or inaccessible: $Root"
+}
+if (-not (Test-Path -LiteralPath $script:Root -PathType Container)) {
+    throw "Root must be a directory: $script:Root"
+}
+
 $markerFiles     = @('README.md','manifest.json','pyproject.toml','package.json')
 $excludedNames   = @('node_modules','.venv','venv')
 $exclusionMarker = '.zipignore'
 
+# Normalize user-supplied extension filters once
 $excludeExtSet = $null
 if ($ExcludeExtensions -and $ExcludeExtensions.Count -gt 0) {
     $excludeExtSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -189,7 +205,7 @@ function Get-MarkedTopLevelDirs {
         [Parameter(Mandatory)][int]$FolderId
     )
 
-    $top = Get-ChildItem -Directory -Force
+    $top = Get-ChildItem -Path $script:Root -Directory -Force
     if (-not $top) { return @() }
 
     $total = $top.Count
@@ -493,9 +509,9 @@ function New-ArchiveFromDir {
     return Get-Item -LiteralPath $ZipPath
 }
 
-$root = Get-Location
-$compressedDir = Join-Path $root "compressed"
-$stagingRoot   = Join-Path $root "__staging_pack"
+# Top-level paths derived from $script:Root
+$compressedDir = Join-Path $script:Root "compressed"
+$stagingRoot   = Join-Path $script:Root "__staging_pack"
 
 if (-not (Test-Path -LiteralPath $compressedDir)) {
     if ($PSCmdlet.ShouldProcess($compressedDir, "Create directory")) {
@@ -581,7 +597,7 @@ foreach ($dir in $targets) {
         Write-Warning ("Error processing {0}: {1}" -f $dir.Name, $_)
     }
     finally {
-        if (Test-Path -LiteralPath $stageDir) {
+        if (Test-Path -LiteralPath $stageDir)) {
             if ($PSCmdlet.ShouldProcess($stageDir, "Cleanup staging")) {
                 Remove-Item -LiteralPath $stageDir -Recurse -Force
             }
@@ -591,4 +607,3 @@ foreach ($dir in $targets) {
 
 Write-Progress -Id $stage2Overall -Completed
 Write-Host ("Done. Archived {0} project(s) to: {1}" -f $totalTargets, $compressedDir)
-
