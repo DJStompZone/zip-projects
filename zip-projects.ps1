@@ -59,7 +59,7 @@ PS> ./zip-projects.ps1 ~/Projects -ExcludeExtensions .zip,.rar
 PS> ./zip-projects.ps1 -Force
 #>
 
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact='Low')]
 param(
     [Parameter(Position=0)]
     [string]$Root = (Get-Location).Path,
