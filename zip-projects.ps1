@@ -1,5 +1,5 @@
 <#PSScriptInfo
-.VERSION 1.7.0
+.VERSION 1.9.0
 .GUID 4c3f8c5b-4f88-47e7-9a45-2a38c1a9a0b3
 .AUTHOR DJ Stomp <85457381+DJStompZone@users.noreply.github.com>
 .COPYRIGHT (c) DJ Stomp. MIT License.
@@ -7,31 +7,41 @@
 
 <#
 .SYNOPSIS
-Zip top-level folders that contain specific marker files and delete sources on success, with scalable progress, typed file lists, and a .zipignore top-level exclusion.
+Zip top-level folders that contain specific marker files and delete sources on success, with scalable progress, path-typed lists, .zipignore support, and SOLID archiver abstraction.
 
 .DESCRIPTION
-Stage 1 scans top-level subdirectories in the current directory. If a subdirectory’s *immediate children* contain ".zipignore"
-(either a file or a directory named exactly ".zipignore"), it is skipped entirely. Otherwise, if its tree contains any of:
+Stage 1 scans top-level subdirectories in the current directory. If a subdirectory’s immediate children contain ".zipignore"
+(file or directory), it is skipped entirely. Otherwise, if its tree contains any of:
   - README.md
   - manifest.json
   - pyproject.toml
   - package.json
 it is selected via a fast DFS that skips heavy directories.
 
-Stage 2 builds a typed file list via DFS that SKIPS excluded directories, then stages a filtered copy
-(creating parent directories on demand) and archives using system zip:
-  zip -5r "<archive>.zip" -- .
-Archive is verified by existence, non-zero size, and optional unzip -tq. Source is deleted only upon verified success.
+Stage 2 builds a typed list of file paths via DFS (skipping excluded directories), then stages a filtered copy
+(creating parent directories on demand) and archives using:
+  - Preferred: system zip → zip -5r "<archive>.zip" -- .
+  - Fallback: Compress-Archive (Optimal)
+Archive is verified by unzip -tq when available, else via .NET ZipArchive. Source is deleted only upon verified success.
 
 Exclusions:
-  - Top-level presence of ".zipignore" => skip project entirely
-  - Directories skipped during traversal: "node_modules", ".venv", "venv"
-  - Files skipped during traversal: "*.zip"
+  - Top-level presence of ".zipignore" => skip project entirely.
+  - Directories skipped during traversal: "node_modules", ".venv", "venv".
+  - File extensions can be excluded by passing -ExcludeExtensions (e.g. -ExcludeExtensions .zip,.rar).
 
 Progress cadence scales with size:
   - Always update on item 1, on the last item, and every 10^(digits-2) items in between.
 
-Overwrites existing archives with the same name.
+Overwrites of existing archives are controlled by -Force / -NoClobber with ShouldProcess confirmation if neither is set.
+
+.PARAMETER ExcludeExtensions
+One or more file extensions to exclude during staging. Example: -ExcludeExtensions .zip,.rar,.iso
+
+.PARAMETER Force
+Overwrite existing archives without prompting.
+
+.PARAMETER NoClobber
+Never overwrite; error if the archive already exists.
 
 .PARAMETER WhatIf
 Shows what would happen if the script runs. No changes are made.
@@ -40,15 +50,33 @@ Shows what would happen if the script runs. No changes are made.
 PS> ./zip-projects.ps1
 
 .EXAMPLE
-PS> ./zip-projects.ps1 -WhatIf
+PS> ./zip-projects.ps1 -ExcludeExtensions .zip,.rar
+
+.EXAMPLE
+PS> ./zip-projects.ps1 -Force
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
-param()
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
+param(
+    [string[]]$ExcludeExtensions,
+    [switch]$Force,
+    [switch]$NoClobber
+)
 
 $markerFiles     = @('README.md','manifest.json','pyproject.toml','package.json')
 $excludedNames   = @('node_modules','.venv','venv')
 $exclusionMarker = '.zipignore'
+
+$excludeExtSet = $null
+if ($ExcludeExtensions -and $ExcludeExtensions.Count -gt 0) {
+    $excludeExtSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($ext in $ExcludeExtensions) {
+        if ([string]::IsNullOrWhiteSpace($ext)) { continue }
+        $e = $ext.Trim()
+        if ($e[0] -ne '.') { $e = '.' + $e }
+        [void]$excludeExtSet.Add($e)
+    }
+}
 
 function Get-ProgressStep {
     <#
@@ -77,12 +105,8 @@ function Test-TopLevelExcluded {
     param([Parameter(Mandatory)][System.IO.DirectoryInfo]$Dir)
 
     try {
-        $childPath = Join-Path $Dir.FullName $exclusionMarker
+        $childPath = [System.IO.Path]::Combine($Dir.FullName, $exclusionMarker)
         if (Test-Path -LiteralPath $childPath) { return $true }
-
-        # Fallback to quick name check over immediate children with -Force so hidden entries are seen
-        $names = Get-ChildItem -LiteralPath $Dir.FullName -Force -Depth 0 -Name -ErrorAction SilentlyContinue
-        if ($names -and ($names -contains $exclusionMarker)) { return $true }
     } catch { return $false }
 
     return $false
@@ -108,10 +132,10 @@ function Test-DirHasMarkerFast {
     )
 
     $markerSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $markerFiles | ForEach-Object { [void]$markerSet.Add($_) }
+    foreach ($m in $markerFiles) { [void]$markerSet.Add($m) }
 
     $excludeDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $excludedNames | ForEach-Object { [void]$excludeDirs.Add($_) }
+    foreach ($n in $excludedNames) { [void]$excludeDirs.Add($n) }
 
     $stack = [System.Collections.Generic.Stack[string]]::new()
     $stack.Push($Dir.FullName) | Out-Null
@@ -121,9 +145,7 @@ function Test-DirHasMarkerFast {
         $current = $stack.Pop()
         try {
             $entries = [System.IO.Directory]::EnumerateFileSystemEntries($current)
-        } catch {
-            continue
-        }
+        } catch { continue }
 
         foreach ($entry in $entries) {
             $name = [System.IO.Path]::GetFileName($entry)
@@ -196,7 +218,7 @@ function Get-MarkedTopLevelDirs {
 function Get-FilesFilteredList {
     <#
     .SYNOPSIS
-    Enumerate files under a source dir while skipping excluded directories, returning a typed List[FileInfo].
+    Enumerate files under a source dir while skipping excluded directories and optional extensions, returning List[string] of full paths.
     .PARAMETER Source
     Source directory path.
     .PARAMETER OverallId
@@ -204,7 +226,7 @@ function Get-FilesFilteredList {
     .PARAMETER FolderId
     Write-Progress ID for Stage 2 per-folder (used for pre-copy "indexing" progress).
     .OUTPUTS
-    System.Collections.Generic.List[System.IO.FileInfo]
+    System.Collections.Generic.List[string]
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -213,12 +235,9 @@ function Get-FilesFilteredList {
     )
 
     $excludeDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $excludedNames | ForEach-Object { [void]$excludeDirs.Add($_) }
+    foreach ($n in $excludedNames) { [void]$excludeDirs.Add($n) }
 
-    $excludeExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    @('.zip') | ForEach-Object { [void]$excludeExtensions.Add($_) }
-
-    $list = New-Object 'System.Collections.Generic.List[System.IO.FileInfo]'
+    $list = New-Object 'System.Collections.Generic.List[string]'
     $stack = [System.Collections.Generic.Stack[string]]::new()
     $rootPath = (Resolve-Path -LiteralPath $Source).Path
     $stack.Push($rootPath) | Out-Null
@@ -239,12 +258,12 @@ function Get-FilesFilteredList {
             }
 
             $seen += 1
-            if ($excludeExtensions.Contains([System.IO.Path]::GetExtension($entry))) { continue }
+            if ($excludeExtSet -ne $null) {
+                $ext = [System.IO.Path]::GetExtension($entry)
+                if ($excludeExtSet.Contains($ext)) { continue }
+            }
 
-            try {
-                $fi = [System.IO.FileInfo]::new($entry)
-                $list.Add($fi)
-            } catch { continue }
+            $list.Add($entry) | Out-Null
 
             $step = Get-ProgressStep -Total $seen
             if ($seen -eq 1 -or ($seen % $step -eq 0)) {
@@ -280,7 +299,7 @@ function Copy-TreeFiltered {
     )
 
     if (-not (Test-Path -LiteralPath $Destination)) {
-        New-Item -ItemType Directory -Path $Destination | Out-Null
+        [void][System.IO.Directory]::CreateDirectory($Destination)
     }
 
     $files = Get-FilesFilteredList -Source $Source -OverallId $OverallId -FolderId $FolderId
@@ -289,13 +308,13 @@ function Copy-TreeFiltered {
 
     $rootResolved = (Resolve-Path -LiteralPath $Source).Path
     $i = 0
-    foreach ($f in $files) {
+    foreach ($path in $files) {
         $i += 1
-        $relative = $f.FullName.Substring($rootResolved.Length).TrimStart('\','/')
+        $relative = [System.IO.Path]::GetRelativePath($rootResolved, $path)
         $destFile = Join-Path $Destination $relative
         $destDir  = Split-Path -Parent $destFile
-        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir | Out-Null }
-        Copy-Item -LiteralPath $f.FullName -Destination $destFile -Force
+        if (-not (Test-Path -LiteralPath $destDir)) { [void][System.IO.Directory]::CreateDirectory($destDir) }
+        [System.IO.File]::Copy($path, $destFile, $true)
 
         if ($i -eq 1 -or $i -eq $total -or ($i % $step -eq 0)) {
             $pct = [int](($i / $total) * 100)
@@ -307,12 +326,140 @@ function Copy-TreeFiltered {
     return $files.Count
 }
 
+function Invoke-External {
+    <#
+    .SYNOPSIS
+    Run an external process with captured stdout/stderr/exit code.
+    .PARAMETER FileName
+    Executable path.
+    .PARAMETER Arguments
+    Command-line arguments.
+    .PARAMETER WorkingDirectory
+    Optional working directory.
+    .OUTPUTS
+    psobject with properties: ExitCode, Stdout, Stderr
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$Arguments,
+        [string]$WorkingDirectory
+    )
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FileName
+    $psi.Arguments = $Arguments
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    [pscustomobject]@{
+        ExitCode = $proc.ExitCode
+        Stdout   = $stdout
+        Stderr   = $stderr
+    }
+}
+
+function Handle-ExistingArchive {
+    <#
+    .SYNOPSIS
+    Apply -Force / -NoClobber / ShouldProcess policy for an existing zip path.
+    .PARAMETER ZipPath
+    Destination zip path.
+    .OUTPUTS
+    None
+    #>
+    param([Parameter(Mandatory)][string]$ZipPath)
+
+    if (-not (Test-Path -LiteralPath $ZipPath)) { return }
+
+    if ($Force) {
+        Remove-Item -LiteralPath $ZipPath -Force
+        return
+    }
+    if ($NoClobber) {
+        throw "Archive already exists at $ZipPath and -NoClobber was specified."
+    }
+    if ($PSCmdlet.ShouldProcess($ZipPath, "Overwrite existing archive")) {
+        Remove-Item -LiteralPath $ZipPath -Force
+        return
+    }
+    throw "Archive already exists at $ZipPath and overwrite was not confirmed."
+}
+
+function Resolve-ArchiveTool {
+    <#
+    .SYNOPSIS
+    Determine the archiving strategy.
+    .OUTPUTS
+    psobject with properties: Mode ('ZipCmd' or 'CompressArchive'), Command (path) when ZipCmd
+    #>
+    $zipCmd = Get-Command zip -ErrorAction SilentlyContinue
+    if ($zipCmd) {
+        return [pscustomobject]@{ Mode = 'ZipCmd'; Command = $zipCmd.Source }
+    }
+    return [pscustomobject]@{ Mode = 'CompressArchive'; Command = $null }
+}
+
+function Test-ZipReadable {
+    <#
+    .SYNOPSIS
+    Verify a zip can be opened and has at least one entry using .NET.
+    .PARAMETER ZipPath
+    Full path to the zip file.
+    .OUTPUTS
+    System.Boolean
+    #>
+    param([Parameter(Mandatory)][string]$ZipPath)
+
+    if (-not (Test-Path -LiteralPath $ZipPath)) { return $false }
+    if ((Get-Item -LiteralPath $ZipPath).Length -le 22) { return $false }
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $fs = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            $zip = [System.IO.Compression.ZipArchive]::new($fs, [System.IO.Compression.ZipArchiveMode]::Read, $false)
+            $ok = ($zip.Entries.Count -gt 0)
+            $zip.Dispose()
+            return $ok
+        } finally { $fs.Dispose() }
+    } catch { return $false }
+}
+
+function Test-ArchiveIntegrity {
+    <#
+    .SYNOPSIS
+    Verify archive via unzip -tq if present; otherwise .NET.
+    .PARAMETER ZipPath
+    Zip path.
+    .OUTPUTS
+    None (throws on failure)
+    #>
+    param([Parameter(Mandatory)][string]$ZipPath)
+
+    $unzip = Get-Command unzip -ErrorAction SilentlyContinue
+    if ($unzip) {
+        $res = Invoke-External -FileName $unzip.Source -Arguments "-tq ""$ZipPath"""
+        if ($res.ExitCode -ne 0) {
+            throw "unzip test failed: $($res.Stdout)$($res.Stderr)"
+        }
+        return
+    }
+
+    if (-not (Test-ZipReadable -ZipPath $ZipPath)) {
+        throw "Archive verification failed: zip unreadable or empty."
+    }
+}
+
 function New-ArchiveFromDir {
     <#
     .SYNOPSIS
-    Create or overwrite a ZIP archive from a directory using /bin/zip -5r, with verification.
+    Create or overwrite a ZIP archive from a directory using the resolved tool (zip or Compress-Archive) and verify integrity.
     .PARAMETER SourceDir
-    Directory to archive.
+    Directory to archive (already staged/filtered).
     .PARAMETER ZipPath
     Destination zip path.
     .OUTPUTS
@@ -323,41 +470,26 @@ function New-ArchiveFromDir {
         [Parameter(Mandatory)][string]$ZipPath
     )
 
-    if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
+    Handle-ExistingArchive -ZipPath $ZipPath
 
     $src = (Resolve-Path -LiteralPath $SourceDir).Path
+    $tool = Resolve-ArchiveTool
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "/bin/zip"
-    $psi.Arguments = "-5r ""$ZipPath"" -- ."
-    $psi.WorkingDirectory = $src
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardError = $true
-    $psi.RedirectStandardOutput = $true
-
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-
-    if ($proc.ExitCode -ne 0) { throw "zip failed with exit code $($proc.ExitCode)`nSTDOUT:`n$stdout`nSTDERR:`n$stderr" }
-    if (-not (Test-Path -LiteralPath $ZipPath)) { throw "zip did not create archive." }
-    if ((Get-Item -LiteralPath $ZipPath).Length -le 22) { throw "zip created a tiny/empty file." }
-
-    $unzip = Get-Command unzip -ErrorAction SilentlyContinue
-    if ($unzip) {
-        $psi2 = New-Object System.Diagnostics.ProcessStartInfo
-        $psi2.FileName = $unzip.Source
-        $psi2.Arguments = "-tq ""$ZipPath"""
-        $psi2.UseShellExecute = $false
-        $psi2.RedirectStandardError = $true
-        $psi2.RedirectStandardOutput = $true
-        $proc2 = [System.Diagnostics.Process]::Start($psi2)
-        $out2 = $proc2.StandardOutput.ReadToEnd() + $proc2.StandardError.ReadToEnd()
-        $proc2.WaitForExit()
-        if ($proc2.ExitCode -ne 0) { throw "unzip test failed: $out2" }
+    if ($tool.Mode -eq 'ZipCmd') {
+        $res = Invoke-External -FileName $tool.Command -Arguments "-5r ""$ZipPath"" -- ." -WorkingDirectory $src
+        if ($res.ExitCode -ne 0) {
+            throw "zip failed with exit code $($res.ExitCode)`nSTDOUT:`n$($res.Stdout)`nSTDERR:`n$($res.Stderr)"
+        }
+    } else {
+        try {
+            Compress-Archive -Path (Join-Path $src '*') -DestinationPath $ZipPath -CompressionLevel Optimal -Force
+        } catch {
+            throw "Compress-Archive failed: $($_.Exception.Message)"
+        }
     }
 
+    if (-not (Test-Path -LiteralPath $ZipPath)) { throw "Archive was not created at $ZipPath." }
+    Test-ArchiveIntegrity -ZipPath $ZipPath
     return Get-Item -LiteralPath $ZipPath
 }
 
@@ -392,7 +524,6 @@ $totalTargets = $targets.Count
 $processed = 0
 
 foreach ($dir in $targets) {
-    # Re-check top-level .zipignore right before processing, in case it appeared after Stage 1
     if (Test-TopLevelExcluded -Dir $dir) {
         Write-Host ("Skipping {0} due to top-level {1}" -f $dir.Name, $exclusionMarker)
         continue
@@ -460,3 +591,4 @@ foreach ($dir in $targets) {
 
 Write-Progress -Id $stage2Overall -Completed
 Write-Host ("Done. Archived {0} project(s) to: {1}" -f $totalTargets, $compressedDir)
+
