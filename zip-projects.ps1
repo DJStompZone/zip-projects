@@ -1,5 +1,5 @@
 <#PSScriptInfo
-.VERSION 1.6.0
+.VERSION 1.7.0
 .GUID 4c3f8c5b-4f88-47e7-9a45-2a38c1a9a0b3
 .AUTHOR DJ Stomp <85457381+DJStompZone@users.noreply.github.com>
 .COPYRIGHT (c) DJ Stomp. MIT License.
@@ -7,10 +7,11 @@
 
 <#
 .SYNOPSIS
-Zip top-level folders that contain specific marker files and delete sources on success, with scalable progress and typed file lists.
+Zip top-level folders that contain specific marker files and delete sources on success, with scalable progress, typed file lists, and a .zipignore top-level exclusion.
 
 .DESCRIPTION
-Stage 1 scans top-level subdirectories in the current directory. If a subdirectory’s tree contains any of:
+Stage 1 scans top-level subdirectories in the current directory. If a subdirectory’s *immediate children* contain ".zipignore"
+(either a file or a directory named exactly ".zipignore"), it is skipped entirely. Otherwise, if its tree contains any of:
   - README.md
   - manifest.json
   - pyproject.toml
@@ -23,8 +24,9 @@ Stage 2 builds a typed file list via DFS that SKIPS excluded directories, then s
 Archive is verified by existence, non-zero size, and optional unzip -tq. Source is deleted only upon verified success.
 
 Exclusions:
-  - Directories: "node_modules", ".venv", "venv"
-  - Files with extension ".zip"
+  - Top-level presence of ".zipignore" => skip project entirely
+  - Directories skipped during traversal: "node_modules", ".venv", "venv"
+  - Files skipped during traversal: "*.zip"
 
 Progress cadence scales with size:
   - Always update on item 1, on the last item, and every 10^(digits-2) items in between.
@@ -44,9 +46,9 @@ PS> ./zip-projects.ps1 -WhatIf
 [CmdletBinding(SupportsShouldProcess)]
 param()
 
-$markerFiles = @('README.md','manifest.json','pyproject.toml','package.json')
-
-$excludedNames = @('node_modules','.venv','venv')
+$markerFiles     = @('README.md','manifest.json','pyproject.toml','package.json')
+$excludedNames   = @('node_modules','.venv','venv')
+$exclusionMarker = '.zipignore'
 
 function Get-ProgressStep {
     <#
@@ -61,6 +63,29 @@ function Get-ProgressStep {
     $n = [math]::Max(1, $Total)
     $digits = ([string]$n).Length
     return [int][math]::Pow(10, [math]::Max(0, $digits - 2))
+}
+
+function Test-TopLevelExcluded {
+    <#
+    .SYNOPSIS
+    Returns $true if a directory contains a top-level ".zipignore" (file or dir).
+    .PARAMETER Dir
+    DirectoryInfo to check.
+    .OUTPUTS
+    System.Boolean
+    #>
+    param([Parameter(Mandatory)][System.IO.DirectoryInfo]$Dir)
+
+    try {
+        $childPath = Join-Path $Dir.FullName $exclusionMarker
+        if (Test-Path -LiteralPath $childPath) { return $true }
+
+        # Fallback to quick name check over immediate children with -Force so hidden entries are seen
+        $names = Get-ChildItem -LiteralPath $Dir.FullName -Force -Depth 0 -Name -ErrorAction SilentlyContinue
+        if ($names -and ($names -contains $exclusionMarker)) { return $true }
+    } catch { return $false }
+
+    return $false
 }
 
 function Test-DirHasMarkerFast {
@@ -129,7 +154,7 @@ function Test-DirHasMarkerFast {
 function Get-MarkedTopLevelDirs {
     <#
     .SYNOPSIS
-    Discover top-level directories that contain any marker file, with progress.
+    Discover top-level directories that contain any marker file, skipping those with a top-level .zipignore, with progress.
     .PARAMETER OverallId
     Write-Progress ID for Stage 1 overall.
     .PARAMETER FolderId
@@ -153,6 +178,12 @@ function Get-MarkedTopLevelDirs {
         $i += 1
         $pct = [int](($i / [math]::Max(1,$total)) * 100)
         Write-Progress -Id $OverallId -Activity "Stage 1: Discovering projects" -Status "Checking $i of $($total): $($dir.Name)" -PercentComplete $pct
+
+        if (Test-TopLevelExcluded -Dir $dir) {
+            Write-Host ("Skipping {0} due to top-level {1}" -f $dir.Name, $exclusionMarker)
+            continue
+        }
+
         Write-Progress -Id $FolderId -ParentId $OverallId -Activity "Stage 1: Scanning $($dir.Name)" -Status "Starting"
         if (Test-DirHasMarkerFast -Dir $dir -OverallId $OverallId -FolderId $FolderId) { $found.Add($dir) }
         Write-Progress -Id $FolderId -Completed
@@ -182,7 +213,7 @@ function Get-FilesFilteredList {
     )
 
     $excludeDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    @('node_modules','.venv','venv') | ForEach-Object { [void]$excludeDirs.Add($_) }
+    $excludedNames | ForEach-Object { [void]$excludeDirs.Add($_) }
 
     $excludeExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     @('.zip') | ForEach-Object { [void]$excludeExtensions.Add($_) }
@@ -361,6 +392,12 @@ $totalTargets = $targets.Count
 $processed = 0
 
 foreach ($dir in $targets) {
+    # Re-check top-level .zipignore right before processing, in case it appeared after Stage 1
+    if (Test-TopLevelExcluded -Dir $dir) {
+        Write-Host ("Skipping {0} due to top-level {1}" -f $dir.Name, $exclusionMarker)
+        continue
+    }
+
     $processed += 1
     $overallPct = [int](($processed / $totalTargets) * 100)
     Write-Progress -Id $stage2Overall -Activity "Stage 2: Archiving projects" -Status "Processing $processed of $($totalTargets): $($dir.Name)" -PercentComplete $overallPct
@@ -413,7 +450,7 @@ foreach ($dir in $targets) {
         Write-Warning ("Error processing {0}: {1}" -f $dir.Name, $_)
     }
     finally {
-        if (Test-Path -LiteralPath $stageDir)) {
+        if (Test-Path -LiteralPath $stageDir) {
             if ($PSCmdlet.ShouldProcess($stageDir, "Cleanup staging")) {
                 Remove-Item -LiteralPath $stageDir -Recurse -Force
             }
